@@ -1,11 +1,10 @@
 <script setup lang="ts">
-import { ref } from "vue";
-
 let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
 
 async function connect() {
   console.log("connect");
+
   const videoEl = document.querySelector("video") as HTMLVideoElement | null;
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
@@ -59,6 +58,7 @@ async function connect() {
 
     const answer = await resp.json();
     await pc.setRemoteDescription(answer);
+
     console.log("Connected to server, sending video frames.");
   } catch (err) {
     console.error("Error connecting:", err);
@@ -67,6 +67,7 @@ async function connect() {
 
 async function disconnect() {
   console.log("disconnect");
+
   if (pc) {
     pc.close();
     pc = null;

@@ -1,17 +1,18 @@
-# main.py
 import asyncio
-import json
+from contextlib import asynccontextmanager
 import os
 import uuid
 from datetime import datetime
 from typing import Dict
 import logging
+import cv2
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.signaling import BYE
+
+from ultralytics import YOLO
 
 # aiortc video frame handling relies on av
 # pip install av to get .to_image()
@@ -19,9 +20,30 @@ from aiortc.contrib.signaling import BYE
 logger = logging.getLogger("uvicorn")
 logger.setLevel(logging.INFO)
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    tasks = []
 
-# Allow your dev origin(s) — adjust in production
+    for _ in range(3):  # dummy loop to use 'yield' for lifespan
+        worker_task = asyncio.create_task(inference_worker())
+        tasks.append(worker_task)
+    logger.info("Inference workers started")
+
+    yield
+
+    try:
+        for worker_task in tasks:
+            worker_task.cancel()
+            await worker_task
+    except asyncio.CancelledError:
+        pass
+
+    logger.info("Inference workers stopped")
+
+app = FastAPI(lifespan=lifespan)
+
+inference_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:3000", "http://localhost:8080", "*"],
@@ -36,10 +58,49 @@ pcs: Dict[str, RTCPeerConnection] = {}
 FRAME_DIR = "frames"
 os.makedirs(FRAME_DIR, exist_ok=True)
 
+model = YOLO("yolov8n.pt") 
 
 class Offer(BaseModel):
     sdp: str
     type: str
+
+async def frame_producer(track):
+    """Receive frames and put them into the inference queue (non-blocking)."""
+    while True:
+        frame = await track.recv()
+        if inference_queue.full():
+            # Drop frame if queue is full (avoid lag)
+            continue
+        await inference_queue.put(frame)
+
+
+async def inference_worker():
+    """Continuously read frames from queue and run ML inference."""
+    while True:
+        frame = await inference_queue.get()
+        try:
+            img = frame.to_ndarray(format="bgr24")
+
+            # ↓ Resize/downsample if needed
+            img_small = cv2.resize(img, (640, 360))
+
+            # ↓ Run model inference
+            results = model.predict(img_small, verbose=False)
+
+            # ↓ Process results (e.g. print or store)
+            boxes = results[0].boxes.xyxy.cpu().numpy().tolist() # type: ignore
+            labels = results[0].boxes.cls.cpu().numpy().tolist() # type: ignore
+            confs = results[0].boxes.conf.cpu().numpy().tolist() # type: ignore
+
+            label_names = [model.names[int(lbl)] for lbl in labels]
+
+            print(f"Detected {len(boxes)} objects in frame, labels: {label_names}, confs: {confs}")
+
+            # Example: you could push results to a WebSocket or DB here
+        except Exception as e:
+            print("Inference error:", e)
+        finally:
+            inference_queue.task_done()
 
 
 async def save_video_frames(pc_id: str, track):
@@ -67,7 +128,7 @@ async def save_video_frames(pc_id: str, track):
 
             logger.info(f"Got frame {filename}")
 
-            # img.save(filename, quality=85)
+            img.save(filename, quality=85)
             counter += 1
 
     except asyncio.CancelledError:
@@ -96,8 +157,10 @@ async def offer(offer: Offer, request: Request):
         print(f"PC {pc_id} Track received: kind={track.kind}")
         if track.kind == "video":
             # create a task to consume all incoming frames
-            task = asyncio.create_task(save_video_frames(pc_id, track))
-            frame_tasks.append(task)
+            # task = asyncio.create_task(save_video_frames(pc_id, track))
+            # frame_tasks.append(task)
+
+            asyncio.create_task(frame_producer(track))
 
         @track.on("ended")
         async def on_ended():
@@ -114,7 +177,6 @@ async def offer(offer: Offer, request: Request):
             pcs.pop(pc_id, None)
             print(f"PC {pc_id} closed and cleaned up")
 
-    # apply remote description
     try:
         await pc.setRemoteDescription(RTCSessionDescription(sdp=offer.sdp, type=offer.type))
     except Exception as e:
