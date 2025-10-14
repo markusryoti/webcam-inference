@@ -116,11 +116,13 @@ async function disconnect() {
 <template>
   <h1 class="text-2xl mb-8 text-center">Start a video feed</h1>
   <div class="flex flex-col items-center justify-center gap-4">
-    <video ref="video" class="border rounded"></video>
+    <div class="flex gap-4">
+      <video ref="video" class="border rounded"></video>
+      <video ref="incomingVideo" class="border rounded" autoplay muted></video>
+    </div>
     <div class="flex flex-row gap-2 mt-2">
       <UButton @click="connect">Start</UButton>
       <UButton @click="disconnect" variant="subtle">Disconnect</UButton>
     </div>
-    <video ref="incomingVideo" class="border rounded" autoplay muted></video>
   </div>
 </template>

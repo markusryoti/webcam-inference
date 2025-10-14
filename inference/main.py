@@ -24,15 +24,15 @@ logger.setLevel(logging.INFO)
 async def lifespan(app: FastAPI):
     tasks: list[asyncio.Task[NoReturn]] = []
 
+    # Initialize track manager
+    track_manager = TrackManager()
+    app.state.track_manager = track_manager
+
     for _ in range(3):
-        worker_task = asyncio.create_task(inference_worker())
+        worker_task = asyncio.create_task(inference_worker(track_manager))
         tasks.append(worker_task)
 
-    # Start frame broadcaster
-    broadcaster_task = asyncio.create_task(frame_broadcaster())
-    tasks.append(broadcaster_task)
-
-    logger.info("Inference workers and frame broadcaster started")
+    logger.info("Inference workers started")
 
     yield
 
@@ -43,18 +43,12 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
-    logger.info("Inference workers and frame broadcaster stopped")
+    logger.info("Inference workers stopped")
 
 
 app = FastAPI(lifespan=lifespan)
 
-inference_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=10)
-outgoing_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=10)
-
-# Shared frame for broadcasting to all tracks
-latest_frame: VideoFrame | None = None
-frame_ready = asyncio.Event()
-active_tracks: list["ProcessedVideoTrack"] = []
+inference_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=30)
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,41 +63,95 @@ pcs: dict[str, RTCPeerConnection] = {}
 model = YOLO("yolov8n.pt")
 
 
+class TrackManager:
+    """Manages video tracks without bottlenecks."""
+
+    def __init__(self):
+        self.active_tracks: list["ProcessedVideoTrack"] = []
+        self._lock = asyncio.Lock()
+
+    async def add_track(self, track: "ProcessedVideoTrack"):
+        """Add a track to receive frames."""
+        async with self._lock:
+            self.active_tracks.append(track)
+
+    async def remove_track(self, track: "ProcessedVideoTrack"):
+        """Remove a track."""
+        async with self._lock:
+            if track in self.active_tracks:
+                self.active_tracks.remove(track)
+
+    async def remove_tracks_by_pc_id(self, pc_id: str):
+        """Remove all tracks associated with a peer connection."""
+        async with self._lock:
+            self.active_tracks = [
+                track for track in self.active_tracks if track.pc_id != pc_id
+            ]
+
+    def broadcast_frame(self, frame: VideoFrame):
+        """Directly feed frame to all active tracks (non-blocking)."""
+        for track in self.active_tracks[
+            :
+        ]:  # Copy to avoid modification during iteration
+            try:
+                track.put_frame_nowait(frame)
+            except Exception as e:
+                logger.error(f"Error feeding frame to track {track.pc_id}: {e}")
+
+    def get_stats(self):
+        """Get track statistics."""
+        return {
+            "active_tracks": len(self.active_tracks),
+            "track_details": [
+                {
+                    "pc_id": track.pc_id,
+                    "kind": track.kind,
+                    "queue_size": track.frame_queue.qsize(),
+                }
+                for track in self.active_tracks
+            ],
+        }
+
+
 class ProcessedVideoTrack(VideoStreamTrack):
     """
-    Custom video track that sends processed frames using broadcast mechanism.
+    Custom video track with direct frame feeding.
     """
 
-    def __init__(self, pc_id: str):
+    def __init__(self, pc_id: str, track_manager: TrackManager):
         super().__init__()
         self.kind = "video"
-        self.last_frame_time = 0
         self.pc_id = pc_id
-        active_tracks.append(self)
+        self.track_manager = track_manager
+        self.frame_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=3)
+        asyncio.create_task(self.track_manager.add_track(self))
+
+    def put_frame_nowait(self, frame: VideoFrame):
+        """Put a frame into this track's queue (non-blocking)."""
+        try:
+            self.frame_queue.put_nowait(frame)
+        except asyncio.QueueFull:
+            # Drop oldest frame if queue is full
+            try:
+                self.frame_queue.get_nowait()
+                self.frame_queue.put_nowait(frame)
+            except asyncio.QueueEmpty:
+                pass
 
     async def recv(self):
         """
         Called by WebRTC to get the next video frame.
-        Returns the latest processed frame.
         """
-        global latest_frame, frame_ready
-
         try:
-            # Wait for a new frame to be available
-            await asyncio.wait_for(frame_ready.wait(), timeout=1.0)
+            # Get frame from this track's dedicated queue
+            frame = await asyncio.wait_for(self.frame_queue.get(), timeout=1.0)
 
-            if latest_frame is not None:
-                # Create a copy of the frame for this track
-                frame = latest_frame
+            # Update frame timestamp and presentation time
+            pts, time_base = await self.next_timestamp()
+            frame.pts = pts
+            frame.time_base = time_base
 
-                # Update frame timestamp and presentation time
-                pts, time_base = await self.next_timestamp()
-                frame.pts = pts
-                frame.time_base = time_base
-
-                return frame
-            else:
-                raise Exception("No frame available")
+            return frame
 
         except asyncio.TimeoutError:
             # If no frame available, create a black frame to maintain stream
@@ -117,8 +165,7 @@ class ProcessedVideoTrack(VideoStreamTrack):
 
         except asyncio.CancelledError:
             # Remove this track from active tracks
-            if self in active_tracks:
-                active_tracks.remove(self)
+            await self.track_manager.remove_track(self)
             raise
 
         except Exception as e:
@@ -133,30 +180,6 @@ class ProcessedVideoTrack(VideoStreamTrack):
             return frame
 
 
-async def frame_broadcaster():
-    """Broadcast frames from outgoing_queue to all active tracks."""
-    global latest_frame, frame_ready
-
-    while True:
-        try:
-            # Get processed frame from outgoing queue
-            frame = await outgoing_queue.get()
-
-            # Update the latest frame for all tracks
-            latest_frame = frame
-            frame_ready.set()
-
-            # Small delay to allow tracks to consume the frame
-            await asyncio.sleep(0.01)
-            frame_ready.clear()
-
-            outgoing_queue.task_done()
-
-        except Exception as e:
-            logger.error(f"Error in frame broadcaster: {e}")
-            await asyncio.sleep(0.1)
-
-
 async def frame_producer(track: VideoStreamTrack):
     """Receive frames and put them into the inference queue (non-blocking)."""
     while True:
@@ -168,7 +191,7 @@ async def frame_producer(track: VideoStreamTrack):
         await inference_queue.put(frame)
 
 
-async def inference_worker():
+async def inference_worker(track_manager: TrackManager):
     """Continuously read frames from queue and run ML inference."""
     while True:
         frame = await inference_queue.get()
@@ -193,9 +216,8 @@ async def inference_worker():
                 f"Detected {len(bxs)} objects in frame, labels: {label_names}, confs: {confs}"
             )
 
-            outgoing_queue.put_nowait(frame)
-
-            logger.info("Sent frame to outgoing queue")
+            # Directly feed frame to all tracks
+            track_manager.broadcast_frame(frame)
 
         except Exception as e:
             print("Inference error:", e)
@@ -238,8 +260,8 @@ async def offer(offer: Offer, request: Request):
             _ = pcs.pop(pc_id, None)
 
             # Clean up any tracks associated with this PC
-            global active_tracks
-            active_tracks = [track for track in active_tracks if track.pc_id != pc_id]
+            if hasattr(request.app.state, "track_manager"):
+                await request.app.state.track_manager.remove_tracks_by_pc_id(pc_id)
 
             print(f"PC {pc_id} closed and cleaned up")
 
@@ -251,9 +273,10 @@ async def offer(offer: Offer, request: Request):
         raise HTTPException(status_code=400, detail=f"Invalid SDP: {e}")
 
     # Add processed video track to send frames back
-    processed_track = ProcessedVideoTrack(pc_id)
-    pc.addTrack(processed_track)
-    print(f"PC {pc_id} Added processed video track")
+    if hasattr(request.app.state, "track_manager"):
+        processed_track = ProcessedVideoTrack(pc_id, request.app.state.track_manager)
+        pc.addTrack(processed_track)
+        print(f"PC {pc_id} Added processed video track")
 
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
@@ -264,19 +287,15 @@ async def offer(offer: Offer, request: Request):
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
+    track_stats = (
+        request.app.state.track_manager.get_stats()
+        if hasattr(request.app.state, "track_manager")
+        else {}
+    )
     return {
         "status": "ok",
         "pcs": len(pcs),
         "inference_queue_size": inference_queue.qsize(),
-        "outgoing_queue_size": outgoing_queue.qsize(),
-        "active_tracks": len(active_tracks),
-        "latest_frame_available": latest_frame is not None,
-        "track_details": [
-            {
-                "pc_id": track.pc_id,
-                "kind": track.kind,
-            }
-            for track in active_tracks
-        ],
+        **track_stats,
     }
