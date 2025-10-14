@@ -1,5 +1,6 @@
 <script setup lang="ts">
 const video = ref<HTMLVideoElement | null>(null);
+const incomingVideo = ref<HTMLVideoElement | null>(null);
 
 let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
@@ -26,6 +27,33 @@ async function connect() {
       console.log("ICE state:", pc?.iceConnectionState);
     };
 
+    // Set up incoming track handler BEFORE creating offer
+    pc.ontrack = (event) => {
+      console.log("Received remote track:", {
+        kind: event.track.kind,
+        id: event.track.id,
+        readyState: event.track.readyState,
+        streamsCount: event.streams.length,
+      });
+
+      if (event.track.kind === "video" && incomingVideo.value) {
+        const stream = event.streams[0] || new MediaStream([event.track]);
+        console.log("Setting incoming video source:", {
+          streamId: stream.id,
+          tracksCount: stream.getTracks().length,
+        });
+
+        incomingVideo.value.srcObject = stream;
+        incomingVideo.value.play().catch((err) => {
+          console.error("Error playing incoming video:", err);
+        });
+
+        console.log("Incoming video element ready");
+      } else {
+        console.log("Skipping track:", event.track.kind);
+      }
+    };
+
     const tracks = localStream.getVideoTracks();
     if (tracks.length > 0) {
       pc.addTrack(tracks[0]!, localStream);
@@ -35,6 +63,7 @@ async function connect() {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
+    console.log("Created offer, sending to server...");
 
     const resp = await fetch("http://localhost:8000/offer", {
       method: "POST",
@@ -51,7 +80,9 @@ async function connect() {
     }
 
     const answer = await resp.json();
+    console.log("Received answer from server, setting remote description...");
     await pc.setRemoteDescription(answer);
+    console.log("Remote description set successfully");
 
     console.log("Connected to server, sending video frames.");
   } catch (err) {
@@ -75,6 +106,10 @@ async function disconnect() {
   if (video.value) {
     video.value.srcObject = null;
   }
+
+  if (incomingVideo.value) {
+    incomingVideo.value.srcObject = null;
+  }
 }
 </script>
 
@@ -86,5 +121,6 @@ async function disconnect() {
       <UButton @click="connect">Start</UButton>
       <UButton @click="disconnect" variant="subtle">Disconnect</UButton>
     </div>
+    <video ref="incomingVideo" class="border rounded" autoplay muted></video>
   </div>
 </template>
