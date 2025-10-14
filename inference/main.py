@@ -1,3 +1,4 @@
+from typing_extensions import override
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ import asyncio
 import uuid
 import logging
 import cv2
+import time
 
 logger = logging.getLogger("uvicorn")
 logger.setLevel(logging.INFO)
@@ -24,7 +26,6 @@ logger.setLevel(logging.INFO)
 async def lifespan(app: FastAPI):
     tasks: list[asyncio.Task[NoReturn]] = []
 
-    # Initialize track manager
     track_manager = TrackManager()
     app.state.track_manager = track_manager
 
@@ -68,7 +69,7 @@ class TrackManager:
 
     def __init__(self):
         self.active_tracks: list["ProcessedVideoTrack"] = []
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def add_track(self, track: "ProcessedVideoTrack"):
         """Add a track to receive frames."""
@@ -120,24 +121,26 @@ class ProcessedVideoTrack(VideoStreamTrack):
 
     def __init__(self, pc_id: str, track_manager: TrackManager):
         super().__init__()
-        self.kind = "video"
-        self.pc_id = pc_id
-        self.track_manager = track_manager
-        self.frame_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=3)
-        asyncio.create_task(self.track_manager.add_track(self))
+        self.kind: str = "video"
+        self.pc_id: str = pc_id
+        self.track_manager: TrackManager = track_manager
+        self.frame_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=10)
+
+        _ = asyncio.create_task(self.track_manager.add_track(self))
 
     def put_frame_nowait(self, frame: VideoFrame):
         """Put a frame into this track's queue (non-blocking)."""
         try:
             self.frame_queue.put_nowait(frame)
         except asyncio.QueueFull:
-            # Drop oldest frame if queue is full
+            logger.warning("Frame queue is full")
             try:
-                self.frame_queue.get_nowait()
+                _ = self.frame_queue.get_nowait()
                 self.frame_queue.put_nowait(frame)
             except asyncio.QueueEmpty:
                 pass
 
+    @override
     async def recv(self):
         """
         Called by WebRTC to get the next video frame.
@@ -196,10 +199,16 @@ async def inference_worker(track_manager: TrackManager):
     while True:
         frame = await inference_queue.get()
         try:
+            start = time.process_time()
             img = frame.to_ndarray(format="bgr24")
             img_small = cv2.resize(img, (640, 360))
+            elapsed = time.process_time() - start
+            logger.info(f"Elapsed time for preprocessing: {elapsed * 1000:.2f} ms")
 
+            start = time.process_time()
             results = model.predict(img_small, verbose=False)  # pyright: ignore[reportUnknownMemberType]
+            elapsed = time.process_time() - start
+            logger.info(f"Elapsed time for inference: {elapsed * 1000:.2f} ms")
 
             boxes = results[0].boxes
 
@@ -212,15 +221,15 @@ async def inference_worker(track_manager: TrackManager):
 
             label_names = [model.names[int(lbl)] for lbl in labels]
 
-            print(
+            logger.info(
                 f"Detected {len(bxs)} objects in frame, labels: {label_names}, confs: {confs}"
             )
 
-            # Directly feed frame to all tracks
+            # Directly feed frame to all tracks (for now just one)
             track_manager.broadcast_frame(frame)
 
         except Exception as e:
-            print("Inference error:", e)
+            logger.error("Inference error:", e)
         finally:
             inference_queue.task_done()
 
@@ -240,30 +249,33 @@ async def offer(offer: Offer, request: Request):
     pc = RTCPeerConnection()
     pc_id = str(uuid.uuid4())[:8]
     pcs[pc_id] = pc
-    print("Created for", pc_id)
+
+    logger.info("Created for", pc_id)
 
     @pc.on("track")
     def on_track(track: VideoStreamTrack):
-        print(f"PC {pc_id} Track received: kind={track.kind}")
+        logger.info(f"PC {pc_id} Track received: kind={track.kind}")
+
         if track.kind == "video":
             _ = asyncio.create_task(frame_producer(track))
 
         @track.on("ended")
         async def on_ended():
-            print(f"PC {pc_id} Track ended ({track.kind})")
+            logger.info(f"PC {pc_id} Track ended ({track.kind})")
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
-        print(f"PC {pc_id} connection state: {pc.connectionState}")
+        logger.info(f"PC {pc_id} connection state: {pc.connectionState}")
+
         if pc.connectionState == "failed" or pc.connectionState == "closed":
             await pc.close()
             _ = pcs.pop(pc_id, None)
 
             # Clean up any tracks associated with this PC
-            if hasattr(request.app.state, "track_manager"):
-                await request.app.state.track_manager.remove_tracks_by_pc_id(pc_id)
+            track_manager: TrackManager = request.app.state.track_manager  # pyright: ignore[reportAny]
+            await track_manager.remove_tracks_by_pc_id(pc_id)
 
-            print(f"PC {pc_id} closed and cleaned up")
+            logger.info(f"PC {pc_id} closed and cleaned up")
 
     try:
         await pc.setRemoteDescription(
@@ -272,27 +284,25 @@ async def offer(offer: Offer, request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid SDP: {e}")
 
-    # Add processed video track to send frames back
-    if hasattr(request.app.state, "track_manager"):
-        processed_track = ProcessedVideoTrack(pc_id, request.app.state.track_manager)
-        pc.addTrack(processed_track)
-        print(f"PC {pc_id} Added processed video track")
+    track_manager: TrackManager = request.app.state.track_manager  # pyright: ignore[reportAny]
+    processed_track = ProcessedVideoTrack(pc_id, track_manager)
+
+    _ = pc.addTrack(processed_track)
+    logger.info(f"PC {pc_id} Added processed video track")
 
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
 
-    print(f"PC {pc_id} answered")
+    logger.info(f"PC {pc_id} answered")
 
     return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
 
 
 @app.get("/health")
 async def health(request: Request):
-    track_stats = (
-        request.app.state.track_manager.get_stats()
-        if hasattr(request.app.state, "track_manager")
-        else {}
-    )
+    track_manager: TrackManager = request.app.state.track_manager  # pyright: ignore[reportAny]
+    track_stats = track_manager.get_stats()
+
     return {
         "status": "ok",
         "pcs": len(pcs),

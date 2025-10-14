@@ -27,7 +27,6 @@ async function connect() {
       console.log("ICE state:", pc?.iceConnectionState);
     };
 
-    // Set up incoming track handler BEFORE creating offer
     pc.ontrack = (event) => {
       console.log("Received remote track:", {
         kind: event.track.kind,
@@ -55,8 +54,8 @@ async function connect() {
     };
 
     const tracks = localStream.getVideoTracks();
-    if (tracks.length > 0) {
-      pc.addTrack(tracks[0]!, localStream);
+    if (tracks[0]) {
+      pc.addTrack(tracks[0], localStream);
     } else {
       console.warn("No video tracks found");
     }
@@ -81,6 +80,7 @@ async function connect() {
 
     const answer = await resp.json();
     console.log("Received answer from server, setting remote description...");
+
     await pc.setRemoteDescription(answer);
     console.log("Remote description set successfully");
 
