@@ -5,47 +5,6 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
 
-function drawPredictions(predictions: Predictions) {
-  if (!canvas.value || !video.value) return;
-
-  const ctx = canvas.value.getContext("2d");
-  if (!ctx) return;
-
-  // Clear previous drawings
-  ctx.clearRect(0, 0, canvas.value.width, canvas.value.height);
-
-  // Set canvas size to match video
-  canvas.value.width = video.value.clientWidth;
-  canvas.value.height = video.value.clientHeight;
-
-  // Draw each bounding box
-  predictions.boxes.forEach((box, i) => {
-    const [x1, y1, x2, y2] = box;
-    const label = predictions.labels[i];
-    const confidence = predictions.confs[i] ?? 0;
-
-    // Calculate box dimensions
-    const boxWidth = x2 - x1;
-    const boxHeight = y2 - y1;
-
-    // Draw rectangle
-    ctx.strokeStyle = "#00ff00";
-    ctx.lineWidth = 2;
-    ctx.strokeRect(x1, y1, boxWidth, boxHeight);
-
-    // Draw label background
-    ctx.fillStyle = "#00ff00";
-    const text = `${label} ${(confidence * 100).toFixed(1)}%`;
-    const textWidth = ctx.measureText(text).width;
-    ctx.fillRect(x1, y1 - 20, textWidth + 10, 20);
-
-    // Draw text
-    ctx.fillStyle = "#000000";
-    ctx.font = "14px Arial";
-    ctx.fillText(text, x1 + 5, y1 - 5);
-  });
-}
-
 interface Predictions {
   labels: string[];
   confs: number[];
@@ -153,6 +112,47 @@ async function disconnect() {
     const ctx = canvas.value.getContext("2d");
     ctx?.clearRect(0, 0, canvas.value.width, canvas.value.height);
   }
+}
+
+function drawPredictions(predictions: Predictions) {
+  if (!canvas.value || !video.value) return;
+
+  const ctx = canvas.value.getContext("2d");
+  if (!ctx) return;
+
+  // Clear previous drawings
+  ctx.clearRect(0, 0, canvas.value.width, canvas.value.height);
+
+  // Set canvas size to match video
+  canvas.value.width = video.value.clientWidth;
+  canvas.value.height = video.value.clientHeight;
+
+  // Draw each bounding box
+  predictions.boxes.forEach((box, i) => {
+    const [x1, y1, x2, y2] = box;
+    const label = predictions.labels[i];
+    const confidence = predictions.confs[i] ?? 0;
+
+    // Calculate box dimensions
+    const boxWidth = x2 - x1;
+    const boxHeight = y2 - y1;
+
+    // Draw rectangle
+    ctx.strokeStyle = "#00ff00";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x1, y1, boxWidth, boxHeight);
+
+    // Draw label background
+    ctx.fillStyle = "#00ff00";
+    const text = `${label} ${(confidence * 100).toFixed(1)}%`;
+    const textWidth = ctx.measureText(text).width;
+    ctx.fillRect(x1, y1 - 20, textWidth + 10, 20);
+
+    // Draw text
+    ctx.fillStyle = "#000000";
+    ctx.font = "14px Arial";
+    ctx.fillText(text, x1 + 5, y1 - 5);
+  });
 }
 </script>
 

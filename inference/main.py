@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-inference_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=5)
+inference_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=3)
 
 app.add_middleware(
     CORSMiddleware,
@@ -128,6 +128,7 @@ async def inference_worker(channel_manager: DataChannelManager):
             confs: list[float] = boxes.conf.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
 
             label_names = [model.names[int(lbl)] for lbl in labels]
+            confs = [round(float(conf), 3) for conf in confs]
 
             logger.info(
                 f"Detected {len(bxs)} objects in frame, labels: {label_names}, confs: {confs}"
@@ -160,13 +161,7 @@ async def offer(offer: Offer, request: Request):
     pc_id = str(uuid.uuid4())
     pcs[pc_id] = pc
 
-    logger.info("Created for", pc_id)
-
-    @pc.on("datachannel")
-    def on_datachannel(channel: RTCDataChannel):
-        logger.info(f"PC {pc_id} Data channel established: {channel.label}")
-        channel_manager: DataChannelManager = request.app.state.channel_manager  # pyright: ignore[reportAny]
-        channel_manager.add_channel(pc_id, channel)
+    logger.info(f"Peer connection created: {pc_id}")
 
     @pc.on("track")
     def on_track(track: VideoStreamTrack):
@@ -191,6 +186,12 @@ async def offer(offer: Offer, request: Request):
             channel_manager.remove_channel(pc_id)
 
             logger.info(f"PC {pc_id} closed and cleaned up")
+
+    @pc.on("datachannel")
+    def on_datachannel(channel: RTCDataChannel):
+        logger.info(f"PC {pc_id} Data channel established: {channel.label}")
+        channel_manager: DataChannelManager = request.app.state.channel_manager  # pyright: ignore[reportAny]
+        channel_manager.add_channel(pc_id, channel)
 
     try:
         await pc.setRemoteDescription(
