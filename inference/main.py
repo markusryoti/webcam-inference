@@ -1,8 +1,10 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pydantic import BaseModel
 from aiortc import (
+    RTCDataChannel,
     RTCPeerConnection,
     RTCSessionDescription,
     VideoStreamTrack,
@@ -14,6 +16,8 @@ from typing import NoReturn
 import asyncio
 import uuid
 import logging
+import time
+import json
 import cv2
 
 logger = logging.getLogger("uvicorn")
@@ -24,8 +28,11 @@ logger.setLevel(logging.INFO)
 async def lifespan(app: FastAPI):
     tasks: list[asyncio.Task[NoReturn]] = []
 
+    channel_manager = DataChannelManager()
+    app.state.channel_manager = channel_manager
+
     for _ in range(3):
-        worker_task = asyncio.create_task(inference_worker())
+        worker_task = asyncio.create_task(inference_worker(channel_manager))
         tasks.append(worker_task)
 
     logger.info("Inference workers started")
@@ -44,7 +51,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-inference_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=10)
+inference_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=5)
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,6 +65,34 @@ pcs: dict[str, RTCPeerConnection] = {}
 
 model = YOLO("yolov8n.pt")
 
+@dataclass
+class Prediction:
+    boxes: list[list[float]]
+    labels: list[str]
+    confs: list[float]
+
+class DataChannelManager:
+    def __init__(self):
+        self.channels: dict[str, RTCDataChannel] = {}
+
+    def send_prediction(self, prediction: Prediction):
+        for pc_id, channel in self.channels.items():
+            if channel.readyState == "open":
+                channel.send(json.dumps(prediction.__dict__))
+            else:
+                logger.warning(f"Channel for PC {pc_id} is not open")
+
+    def add_channel(self, pc_id: str, channel: RTCDataChannel):
+        self.channels[pc_id] = channel
+        logger.info(f"Data channel added for PC {pc_id}")
+
+    def remove_channel(self, pc_id: str):
+        channel = self.channels.pop(pc_id, None)
+        if channel:
+            logger.info(f"Data channel removed for PC {pc_id}")
+        else:
+            logger.warning(f"No data channel found for PC {pc_id} to remove")
+
 
 async def frame_producer(track: VideoStreamTrack):
     """Receive frames and put them into the inference queue (non-blocking)."""
@@ -65,12 +100,12 @@ async def frame_producer(track: VideoStreamTrack):
         frame: VideoFrame = await track.recv()  # pyright: ignore[reportAssignmentType]
         if inference_queue.full():
             logger.warning("Inference queue is full, dropping frame")
-            continue
+            _ = inference_queue.get_nowait()
 
         await inference_queue.put(frame)
 
 
-async def inference_worker():
+async def inference_worker(channel_manager: DataChannelManager):
     """Continuously read frames from queue and run ML inference."""
     while True:
         frame = await inference_queue.get()
@@ -78,7 +113,10 @@ async def inference_worker():
             img = frame.to_ndarray(format="bgr24")
             img_small = cv2.resize(img, (640, 360))
 
+            start = time.process_time()
             results = model.predict(img_small, verbose=False)  # pyright: ignore[reportUnknownMemberType]
+            elapsed = time.process_time() - start
+            logger.info(f"Elapsed time for inference: {elapsed * 1000:.2f} ms")
 
             boxes = results[0].boxes
 
@@ -91,12 +129,16 @@ async def inference_worker():
 
             label_names = [model.names[int(lbl)] for lbl in labels]
 
-            print(
+            logger.info(
                 f"Detected {len(bxs)} objects in frame, labels: {label_names}, confs: {confs}"
             )
 
+            prediction = Prediction(boxes=bxs, labels=label_names, confs=confs)
+
+            channel_manager.send_prediction(prediction)
+
         except Exception as e:
-            print("Inference error:", e)
+            logger.error("Inference error:", e)
         finally:
             inference_queue.task_done()
 
@@ -114,27 +156,41 @@ async def offer(offer: Offer, request: Request):
     Response: { "sdp": "<answer_sdp>", "type": "answer" }
     """
     pc = RTCPeerConnection()
-    pc_id = str(uuid.uuid4())[:8]
+
+    pc_id = str(uuid.uuid4())
     pcs[pc_id] = pc
-    print("Created for", pc_id)
+
+    logger.info("Created for", pc_id)
+
+    @pc.on("datachannel")
+    def on_datachannel(channel: RTCDataChannel):
+        logger.info(f"PC {pc_id} Data channel established: {channel.label}")
+        channel_manager: DataChannelManager = request.app.state.channel_manager  # pyright: ignore[reportAny]
+        channel_manager.add_channel(pc_id, channel)
 
     @pc.on("track")
     def on_track(track: VideoStreamTrack):
-        print(f"PC {pc_id} Track received: kind={track.kind}")
+        logger.info(f"PC {pc_id} Track received: kind={track.kind}")
+
         if track.kind == "video":
             _ = asyncio.create_task(frame_producer(track))
 
         @track.on("ended")
         async def on_ended():
-            print(f"PC {pc_id} Track ended ({track.kind})")
+            logger.info(f"PC {pc_id} Track ended ({track.kind})")
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
-        print(f"PC {pc_id} connection state: {pc.connectionState}")
+        logger.info(f"PC {pc_id} connection state: {pc.connectionState}")
+
         if pc.connectionState == "failed" or pc.connectionState == "closed":
             await pc.close()
             _ = pcs.pop(pc_id, None)
-            print(f"PC {pc_id} closed and cleaned up")
+
+            channel_manager: DataChannelManager = request.app.state.channel_manager  # pyright: ignore[reportAny]
+            channel_manager.remove_channel(pc_id)
+
+            logger.info(f"PC {pc_id} closed and cleaned up")
 
     try:
         await pc.setRemoteDescription(
@@ -143,16 +199,11 @@ async def offer(offer: Offer, request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid SDP: {e}")
 
-    # We do not create any outgoing tracks in this example (server is receive-only),
-    # but we still need to create an answer.
+
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
 
-    print(f"PC {pc_id} answered")
+    logger.info(f"PC {pc_id} answered")
 
     return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
 
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "pcs": len(pcs)}
