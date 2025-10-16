@@ -67,6 +67,7 @@ model = YOLO("yolov8n.pt")
 
 @dataclass
 class Prediction:
+    tracking_ids: list[int]
     boxes: list[list[float]]
     labels: list[str]
     confs: list[float]
@@ -114,7 +115,8 @@ async def inference_worker(channel_manager: DataChannelManager):
             img_small = cv2.resize(img, (640, 360))
 
             start = time.process_time()
-            results = model.predict(img_small, verbose=False)  # pyright: ignore[reportUnknownMemberType]
+            # results = model.predict(img_small, verbose=False)
+            results = model.track(img_small, persist=True)  
             elapsed = time.process_time() - start
             logger.info(f"Elapsed time for inference: {elapsed * 1000:.2f} ms")
 
@@ -123,6 +125,12 @@ async def inference_worker(channel_manager: DataChannelManager):
             if not boxes:
                 continue
 
+            tracking_ids = boxes.id
+            if not tracking_ids:
+                logger.warning("No tracking IDs found, skipping frame")
+                continue
+
+            tracking_ids = tracking_ids.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
             bxs: list[list[float]] = boxes.xyxy.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
             labels: list[float] = boxes.cls.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
             confs: list[float] = boxes.conf.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
@@ -134,9 +142,12 @@ async def inference_worker(channel_manager: DataChannelManager):
                 f"Detected {len(bxs)} objects in frame, labels: {label_names}, confs: {confs}"
             )
 
-            prediction = Prediction(boxes=bxs, labels=label_names, confs=confs)
+            prediction = Prediction(tracking_ids=tracking_ids, boxes=bxs, labels=label_names, confs=confs)
 
             channel_manager.send_prediction(prediction)
+
+            # TODO
+            # Forward the prediction to inference aggregator for IoT Hub preprocessing
 
         except Exception as e:
             logger.error("Inference error:", e)
