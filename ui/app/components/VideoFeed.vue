@@ -49,6 +49,7 @@ function drawPredictions(predictions: Predictions) {
 interface Predictions {
   labels: string[];
   confs: number[];
+  // x1, y1, x2, y2
   boxes: Array<[number, number, number, number]>;
 }
 
@@ -88,7 +89,6 @@ async function connect() {
     dataChannel.onmessage = (event) => {
       try {
         const predictions: Predictions = JSON.parse(event.data);
-        console.log("Received prediction:", predictions);
         drawPredictions(predictions);
       } catch (err) {
         console.error("Error parsing prediction:", err);
