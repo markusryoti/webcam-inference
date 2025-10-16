@@ -19,20 +19,26 @@ import logging
 import time
 import json
 import cv2
+import os
 
 logger = logging.getLogger("uvicorn")
 logger.setLevel(logging.INFO)
 
+
+if os.path.exists("events.log"):
+    os.remove("events.log")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tasks: list[asyncio.Task[NoReturn]] = []
 
     channel_manager = DataChannelManager()
+    aggregator = Aggregator()
+
     app.state.channel_manager = channel_manager
 
     for _ in range(3):
-        worker_task = asyncio.create_task(inference_worker(channel_manager))
+        worker_task = asyncio.create_task(inference_worker(channel_manager, aggregator))
         tasks.append(worker_task)
 
     logger.info("Inference workers started")
@@ -64,6 +70,7 @@ app.add_middleware(
 pcs: dict[str, RTCPeerConnection] = {}
 
 model = YOLO("yolov8n.pt")
+
 
 @dataclass
 class Prediction:
@@ -105,8 +112,65 @@ async def frame_producer(track: VideoStreamTrack):
 
         await inference_queue.put(frame)
 
+@dataclass
+class AggregateEvent:
+    tracking_id: int
+    timestamp: float
+    time_span: float
+    label: str
+    confidence: float
 
-async def inference_worker(channel_manager: DataChannelManager):
+    def __str__(self) -> str:
+        return f"AggregateEvent(id={self.tracking_id}, ts={self.timestamp}, span={self.time_span:.2f}s, pred={self.label}, conf={self.confidence})"
+
+@dataclass
+class TrackingEvent:
+    timestamp: float
+    label: str
+    confidence: float
+
+class Aggregator:
+    def __init__(self):
+        self.run = True
+        self.expiry_time = 5.0
+        self.predictions: dict[int, list[TrackingEvent]] = {}
+
+    def add_prediction(self, prediction: Prediction):
+        timestamp = time.time()
+
+        for tid, label, conf in zip(prediction.tracking_ids, prediction.labels, prediction.confs):
+            event = TrackingEvent(timestamp=timestamp, label=label, confidence=conf)
+
+            if tid not in self.predictions:
+                self.predictions[tid] = []
+
+            self.predictions[tid].append(event)
+
+        self.forward_expired()
+    
+    def forward_expired(self):
+        for id, evts in list(self.predictions.items()):
+            now = time.time()
+            last = evts[-1]
+            span = now - last.timestamp
+
+            if span > self.expiry_time:
+                mean_confidence = sum(evt.confidence for evt in evts) / len(evts)
+                first = evts[0]
+                event = AggregateEvent(tracking_id=id, timestamp=now, time_span=span, label=first.label, confidence=mean_confidence)
+
+                logger.info(f"Aggregating event: {event}")
+
+                # TODO
+                # Send forward
+
+                with open("events.log", "a") as f:
+                    f.write(f"{event}\n")
+
+                del self.predictions[id]
+
+
+async def inference_worker(channel_manager: DataChannelManager, aggregator: Aggregator):
     """Continuously read frames from queue and run ML inference."""
     while True:
         frame = await inference_queue.get()
@@ -115,7 +179,6 @@ async def inference_worker(channel_manager: DataChannelManager):
             img_small = cv2.resize(img, (640, 360))
 
             start = time.process_time()
-            # results = model.predict(img_small, verbose=False)
             results = model.track(img_small, persist=True)  
             elapsed = time.process_time() - start
             logger.info(f"Elapsed time for inference: {elapsed * 1000:.2f} ms")
@@ -126,7 +189,7 @@ async def inference_worker(channel_manager: DataChannelManager):
                 continue
 
             tracking_ids = boxes.id
-            if not tracking_ids:
+            if tracking_ids is None:
                 logger.warning("No tracking IDs found, skipping frame")
                 continue
 
@@ -146,8 +209,7 @@ async def inference_worker(channel_manager: DataChannelManager):
 
             channel_manager.send_prediction(prediction)
 
-            # TODO
-            # Forward the prediction to inference aggregator for IoT Hub preprocessing
+            aggregator.add_prediction(prediction)
 
         except Exception as e:
             logger.error("Inference error:", e)
