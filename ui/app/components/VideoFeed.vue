@@ -6,6 +6,7 @@ let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
 
 interface Predictions {
+  tracking_ids: number[];
   labels: string[];
   confs: number[];
   // x1, y1, x2, y2
@@ -144,7 +145,9 @@ function drawPredictions(predictions: Predictions) {
 
     // Draw label background
     ctx.fillStyle = "#00ff00";
-    const text = `${label} ${(confidence * 100).toFixed(1)}%`;
+    const text = `${predictions.tracking_ids[i]}: ${label} ${(
+      confidence * 100
+    ).toFixed(1)}%`;
     const textWidth = ctx.measureText(text).width;
     ctx.fillRect(x1, y1 - 20, textWidth + 10, 20);
 
