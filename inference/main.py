@@ -1,9 +1,10 @@
-from typing_extensions import override
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pydantic import BaseModel
 from aiortc import (
+    RTCDataChannel,
     RTCPeerConnection,
     RTCSessionDescription,
     VideoStreamTrack,
@@ -15,8 +16,9 @@ from typing import NoReturn
 import asyncio
 import uuid
 import logging
-import cv2
 import time
+import json
+import cv2
 
 logger = logging.getLogger("uvicorn")
 logger.setLevel(logging.INFO)
@@ -26,11 +28,11 @@ logger.setLevel(logging.INFO)
 async def lifespan(app: FastAPI):
     tasks: list[asyncio.Task[NoReturn]] = []
 
-    track_manager = TrackManager()
-    app.state.track_manager = track_manager
+    channel_manager = DataChannelManager()
+    app.state.channel_manager = channel_manager
 
     for _ in range(3):
-        worker_task = asyncio.create_task(inference_worker(track_manager))
+        worker_task = asyncio.create_task(inference_worker(channel_manager))
         tasks.append(worker_task)
 
     logger.info("Inference workers started")
@@ -49,7 +51,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-inference_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=30)
+inference_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=5)
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,124 +65,33 @@ pcs: dict[str, RTCPeerConnection] = {}
 
 model = YOLO("yolov8n.pt")
 
+@dataclass
+class Prediction:
+    boxes: list[list[float]]
+    labels: list[str]
+    confs: list[float]
 
-class TrackManager:
-    """Manages video tracks without bottlenecks."""
-
+class DataChannelManager:
     def __init__(self):
-        self.active_tracks: list["ProcessedVideoTrack"] = []
-        self._lock: asyncio.Lock = asyncio.Lock()
+        self.channels: dict[str, RTCDataChannel] = {}
 
-    async def add_track(self, track: "ProcessedVideoTrack"):
-        """Add a track to receive frames."""
-        async with self._lock:
-            self.active_tracks.append(track)
+    def send_prediction(self, prediction: Prediction):
+        for pc_id, channel in self.channels.items():
+            if channel.readyState == "open":
+                channel.send(json.dumps(prediction.__dict__))
+            else:
+                logger.warning(f"Channel for PC {pc_id} is not open")
 
-    async def remove_track(self, track: "ProcessedVideoTrack"):
-        """Remove a track."""
-        async with self._lock:
-            if track in self.active_tracks:
-                self.active_tracks.remove(track)
+    def add_channel(self, pc_id: str, channel: RTCDataChannel):
+        self.channels[pc_id] = channel
+        logger.info(f"Data channel added for PC {pc_id}")
 
-    async def remove_tracks_by_pc_id(self, pc_id: str):
-        """Remove all tracks associated with a peer connection."""
-        async with self._lock:
-            self.active_tracks = [
-                track for track in self.active_tracks if track.pc_id != pc_id
-            ]
-
-    def broadcast_frame(self, frame: VideoFrame):
-        """Directly feed frame to all active tracks (non-blocking)."""
-        for track in self.active_tracks[
-            :
-        ]:  # Copy to avoid modification during iteration
-            try:
-                track.put_frame_nowait(frame)
-            except Exception as e:
-                logger.error(f"Error feeding frame to track {track.pc_id}: {e}")
-
-    def get_stats(self):
-        """Get track statistics."""
-        return {
-            "active_tracks": len(self.active_tracks),
-            "track_details": [
-                {
-                    "pc_id": track.pc_id,
-                    "kind": track.kind,
-                    "queue_size": track.frame_queue.qsize(),
-                }
-                for track in self.active_tracks
-            ],
-        }
-
-
-class ProcessedVideoTrack(VideoStreamTrack):
-    """
-    Custom video track with direct frame feeding.
-    """
-
-    def __init__(self, pc_id: str, track_manager: TrackManager):
-        super().__init__()
-        self.kind: str = "video"
-        self.pc_id: str = pc_id
-        self.track_manager: TrackManager = track_manager
-        self.frame_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=10)
-
-        _ = asyncio.create_task(self.track_manager.add_track(self))
-
-    def put_frame_nowait(self, frame: VideoFrame):
-        """Put a frame into this track's queue (non-blocking)."""
-        try:
-            self.frame_queue.put_nowait(frame)
-        except asyncio.QueueFull:
-            logger.warning("Frame queue is full")
-            try:
-                _ = self.frame_queue.get_nowait()
-                self.frame_queue.put_nowait(frame)
-            except asyncio.QueueEmpty:
-                pass
-
-    @override
-    async def recv(self):
-        """
-        Called by WebRTC to get the next video frame.
-        """
-        try:
-            # Get frame from this track's dedicated queue
-            frame = await asyncio.wait_for(self.frame_queue.get(), timeout=1.0)
-
-            # Update frame timestamp and presentation time
-            pts, time_base = await self.next_timestamp()
-            frame.pts = pts
-            frame.time_base = time_base
-
-            return frame
-
-        except asyncio.TimeoutError:
-            # If no frame available, create a black frame to maintain stream
-            frame = VideoFrame.from_ndarray(
-                cv2.zeros((360, 640, 3), dtype="uint8"), format="bgr24"
-            )
-            pts, time_base = await self.next_timestamp()
-            frame.pts = pts
-            frame.time_base = time_base
-            return frame
-
-        except asyncio.CancelledError:
-            # Remove this track from active tracks
-            await self.track_manager.remove_track(self)
-            raise
-
-        except Exception as e:
-            logger.error(f"Error getting frame: {e}")
-            # Return a black frame as fallback
-            frame = VideoFrame.from_ndarray(
-                cv2.zeros((360, 640, 3), dtype="uint8"), format="bgr24"
-            )
-            pts, time_base = await self.next_timestamp()
-            frame.pts = pts
-            frame.time_base = time_base
-            return frame
+    def remove_channel(self, pc_id: str):
+        channel = self.channels.pop(pc_id, None)
+        if channel:
+            logger.info(f"Data channel removed for PC {pc_id}")
+        else:
+            logger.warning(f"No data channel found for PC {pc_id} to remove")
 
 
 async def frame_producer(track: VideoStreamTrack):
@@ -189,21 +100,18 @@ async def frame_producer(track: VideoStreamTrack):
         frame: VideoFrame = await track.recv()  # pyright: ignore[reportAssignmentType]
         if inference_queue.full():
             logger.warning("Inference queue is full, dropping frame")
-            continue
+            _ = inference_queue.get_nowait()
 
         await inference_queue.put(frame)
 
 
-async def inference_worker(track_manager: TrackManager):
+async def inference_worker(channel_manager: DataChannelManager):
     """Continuously read frames from queue and run ML inference."""
     while True:
         frame = await inference_queue.get()
         try:
-            start = time.process_time()
             img = frame.to_ndarray(format="bgr24")
             img_small = cv2.resize(img, (640, 360))
-            elapsed = time.process_time() - start
-            logger.info(f"Elapsed time for preprocessing: {elapsed * 1000:.2f} ms")
 
             start = time.process_time()
             results = model.predict(img_small, verbose=False)  # pyright: ignore[reportUnknownMemberType]
@@ -225,8 +133,9 @@ async def inference_worker(track_manager: TrackManager):
                 f"Detected {len(bxs)} objects in frame, labels: {label_names}, confs: {confs}"
             )
 
-            # Directly feed frame to all tracks (for now just one)
-            track_manager.broadcast_frame(frame)
+            prediction = Prediction(boxes=bxs, labels=label_names, confs=confs)
+
+            channel_manager.send_prediction(prediction)
 
         except Exception as e:
             logger.error("Inference error:", e)
@@ -247,10 +156,17 @@ async def offer(offer: Offer, request: Request):
     Response: { "sdp": "<answer_sdp>", "type": "answer" }
     """
     pc = RTCPeerConnection()
-    pc_id = str(uuid.uuid4())[:8]
+
+    pc_id = str(uuid.uuid4())
     pcs[pc_id] = pc
 
     logger.info("Created for", pc_id)
+
+    @pc.on("datachannel")
+    def on_datachannel(channel: RTCDataChannel):
+        logger.info(f"PC {pc_id} Data channel established: {channel.label}")
+        channel_manager: DataChannelManager = request.app.state.channel_manager  # pyright: ignore[reportAny]
+        channel_manager.add_channel(pc_id, channel)
 
     @pc.on("track")
     def on_track(track: VideoStreamTrack):
@@ -271,9 +187,8 @@ async def offer(offer: Offer, request: Request):
             await pc.close()
             _ = pcs.pop(pc_id, None)
 
-            # Clean up any tracks associated with this PC
-            track_manager: TrackManager = request.app.state.track_manager  # pyright: ignore[reportAny]
-            await track_manager.remove_tracks_by_pc_id(pc_id)
+            channel_manager: DataChannelManager = request.app.state.channel_manager  # pyright: ignore[reportAny]
+            channel_manager.remove_channel(pc_id)
 
             logger.info(f"PC {pc_id} closed and cleaned up")
 
@@ -284,11 +199,6 @@ async def offer(offer: Offer, request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid SDP: {e}")
 
-    track_manager: TrackManager = request.app.state.track_manager  # pyright: ignore[reportAny]
-    processed_track = ProcessedVideoTrack(pc_id, track_manager)
-
-    _ = pc.addTrack(processed_track)
-    logger.info(f"PC {pc_id} Added processed video track")
 
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
@@ -297,15 +207,3 @@ async def offer(offer: Offer, request: Request):
 
     return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
 
-
-@app.get("/health")
-async def health(request: Request):
-    track_manager: TrackManager = request.app.state.track_manager  # pyright: ignore[reportAny]
-    track_stats = track_manager.get_stats()
-
-    return {
-        "status": "ok",
-        "pcs": len(pcs),
-        "inference_queue_size": inference_queue.qsize(),
-        **track_stats,
-    }

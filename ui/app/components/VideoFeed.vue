@@ -1,16 +1,63 @@
 <script setup lang="ts">
 const video = ref<HTMLVideoElement | null>(null);
-const incomingVideo = ref<HTMLVideoElement | null>(null);
+const canvas = ref<HTMLCanvasElement | null>(null);
 
 let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
+
+function drawPredictions(predictions: Predictions) {
+  if (!canvas.value || !video.value) return;
+
+  const ctx = canvas.value.getContext("2d");
+  if (!ctx) return;
+
+  // Clear previous drawings
+  ctx.clearRect(0, 0, canvas.value.width, canvas.value.height);
+
+  // Set canvas size to match video
+  canvas.value.width = video.value.clientWidth;
+  canvas.value.height = video.value.clientHeight;
+
+  // Draw each bounding box
+  predictions.boxes.forEach((box, i) => {
+    const [x1, y1, x2, y2] = box;
+    const label = predictions.labels[i];
+    const confidence = predictions.confs[i] ?? 0;
+
+    // Calculate box dimensions
+    const boxWidth = x2 - x1;
+    const boxHeight = y2 - y1;
+
+    // Draw rectangle
+    ctx.strokeStyle = "#00ff00";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x1, y1, boxWidth, boxHeight);
+
+    // Draw label background
+    ctx.fillStyle = "#00ff00";
+    const text = `${label} ${(confidence * 100).toFixed(1)}%`;
+    const textWidth = ctx.measureText(text).width;
+    ctx.fillRect(x1, y1 - 20, textWidth + 10, 20);
+
+    // Draw text
+    ctx.fillStyle = "#000000";
+    ctx.font = "14px Arial";
+    ctx.fillText(text, x1 + 5, y1 - 5);
+  });
+}
+
+interface Predictions {
+  labels: string[];
+  confs: number[];
+  boxes: Array<[number, number, number, number]>;
+}
 
 async function connect() {
   console.log("connect");
 
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
-      video: true,
+      video: { width: 640, height: 360 },
       audio: false,
     });
 
@@ -27,29 +74,24 @@ async function connect() {
       console.log("ICE state:", pc?.iceConnectionState);
     };
 
-    pc.ontrack = (event) => {
-      console.log("Received remote track:", {
-        kind: event.track.kind,
-        id: event.track.id,
-        readyState: event.track.readyState,
-        streamsCount: event.streams.length,
-      });
+    const dataChannel = pc.createDataChannel("predictions");
+    console.log("Created data channel:", dataChannel.label);
 
-      if (event.track.kind === "video" && incomingVideo.value) {
-        const stream = event.streams[0] || new MediaStream([event.track]);
-        console.log("Setting incoming video source:", {
-          streamId: stream.id,
-          tracksCount: stream.getTracks().length,
-        });
+    dataChannel.onopen = () => {
+      console.log("Data channel is open");
+    };
 
-        incomingVideo.value.srcObject = stream;
-        incomingVideo.value.play().catch((err) => {
-          console.error("Error playing incoming video:", err);
-        });
+    dataChannel.onclose = () => {
+      console.log("Data channel is closed");
+    };
 
-        console.log("Incoming video element ready");
-      } else {
-        console.log("Skipping track:", event.track.kind);
+    dataChannel.onmessage = (event) => {
+      try {
+        const predictions: Predictions = JSON.parse(event.data);
+        console.log("Received prediction:", predictions);
+        drawPredictions(predictions);
+      } catch (err) {
+        console.error("Error parsing prediction:", err);
       }
     };
 
@@ -107,8 +149,9 @@ async function disconnect() {
     video.value.srcObject = null;
   }
 
-  if (incomingVideo.value) {
-    incomingVideo.value.srcObject = null;
+  if (canvas.value) {
+    const ctx = canvas.value.getContext("2d");
+    ctx?.clearRect(0, 0, canvas.value.width, canvas.value.height);
   }
 }
 </script>
@@ -116,9 +159,12 @@ async function disconnect() {
 <template>
   <h1 class="text-2xl mb-8 text-center">Start a video feed</h1>
   <div class="flex flex-col items-center justify-center gap-4">
-    <div class="flex gap-4">
+    <div class="relative">
       <video ref="video" class="border rounded"></video>
-      <video ref="incomingVideo" class="border rounded" autoplay muted></video>
+      <canvas
+        ref="canvas"
+        class="absolute top-0 left-0 w-full h-full pointer-events-none"
+      ></canvas>
     </div>
     <div class="flex flex-row gap-2 mt-2">
       <UButton @click="connect">Start</UButton>
