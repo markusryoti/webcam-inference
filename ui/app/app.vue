@@ -1,6 +1,7 @@
 <template>
   <UApp>
-    <NuxtPage />
-    <VideoFeed />
+    <NuxtLayout>
+      <NuxtPage />
+    </NuxtLayout>
   </UApp>
 </template>

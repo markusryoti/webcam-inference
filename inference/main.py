@@ -12,7 +12,6 @@ from services.datachannel import DataChannelManager
 from services.inference import inference_worker
 
 logger = logging.getLogger("uvicorn")
-logger.setLevel(logging.INFO)
 
 
 if os.path.exists("events.log"):

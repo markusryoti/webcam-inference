@@ -17,14 +17,14 @@ from services.inference import frame_producer
 logger = logging.getLogger("uvicorn")
 
 
-class Offer(BaseModel):
-    sdp: str
-    type: str
-
-
 router = APIRouter()
 
 pcs: dict[str, RTCPeerConnection] = {}
+
+
+class Offer(BaseModel):
+    sdp: str
+    type: str
 
 
 @router.post("/offer")

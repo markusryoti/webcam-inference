@@ -160,7 +160,6 @@ function drawPredictions(predictions: Predictions) {
 </script>
 
 <template>
-  <h1 class="text-2xl mb-8 text-center">Start a video feed</h1>
   <div class="flex flex-col items-center justify-center gap-4">
     <div class="relative">
       <video ref="video" class="border rounded"></video>
