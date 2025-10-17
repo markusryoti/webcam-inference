@@ -1,8 +1,13 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import json
+import logging
+import os
+import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pydantic import BaseModel
+
+import cv2
 from aiortc import (
     RTCDataChannel,
     RTCPeerConnection,
@@ -10,16 +15,10 @@ from aiortc import (
     VideoStreamTrack,
 )
 from av.video.frame import VideoFrame
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from ultralytics.models import YOLO
-from typing import NoReturn
-
-import asyncio
-import uuid
-import logging
-import time
-import json
-import cv2
-import os
 
 logger = logging.getLogger("uvicorn")
 logger.setLevel(logging.INFO)
@@ -28,9 +27,10 @@ logger.setLevel(logging.INFO)
 if os.path.exists("events.log"):
     os.remove("events.log")
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    tasks: list[asyncio.Task[NoReturn]] = []
+    tasks: list[asyncio.Task[None]] = []
 
     channel_manager = DataChannelManager()
     aggregator = Aggregator()
@@ -79,6 +79,7 @@ class Prediction:
     labels: list[str]
     confs: list[float]
 
+
 class DataChannelManager:
     def __init__(self):
         self.channels: dict[str, RTCDataChannel] = {}
@@ -105,12 +106,17 @@ class DataChannelManager:
 async def frame_producer(track: VideoStreamTrack):
     """Receive frames and put them into the inference queue (non-blocking)."""
     while True:
-        frame: VideoFrame = await track.recv()  # pyright: ignore[reportAssignmentType]
-        if inference_queue.full():
-            logger.warning("Inference queue is full, dropping frame")
-            _ = inference_queue.get_nowait()
+        try:
+            frame: VideoFrame = await track.recv()  # pyright: ignore[reportAssignmentType]
+            if inference_queue.full():
+                logger.warning("Inference queue is full, dropping frame")
+                _ = inference_queue.get_nowait()
 
-        await inference_queue.put(frame)
+            await inference_queue.put(frame)
+        except Exception as e:
+            logger.warning(f"Exception in frame producer: {e}, track might be closed")
+            return
+
 
 @dataclass
 class AggregateEvent:
@@ -123,22 +129,26 @@ class AggregateEvent:
     def __str__(self) -> str:
         return f"AggregateEvent(id={self.tracking_id}, ts={self.timestamp}, span={self.time_span:.2f}s, pred={self.label}, conf={self.confidence})"
 
+
 @dataclass
 class TrackingEvent:
     timestamp: float
     label: str
     confidence: float
 
+
 class Aggregator:
     def __init__(self):
-        self.run = True
-        self.expiry_time = 5.0
+        self.expiry_time: float = 5.0
+        self.confidence_threshold: float = 0.6
         self.predictions: dict[int, list[TrackingEvent]] = {}
 
     def add_prediction(self, prediction: Prediction):
         timestamp = time.time()
 
-        for tid, label, conf in zip(prediction.tracking_ids, prediction.labels, prediction.confs):
+        for tid, label, conf in zip(
+            prediction.tracking_ids, prediction.labels, prediction.confs
+        ):
             event = TrackingEvent(timestamp=timestamp, label=label, confidence=conf)
 
             if tid not in self.predictions:
@@ -147,7 +157,7 @@ class Aggregator:
             self.predictions[tid].append(event)
 
         self.forward_expired()
-    
+
     def forward_expired(self):
         for id, evts in list(self.predictions.items()):
             now = time.time()
@@ -157,64 +167,84 @@ class Aggregator:
             if span > self.expiry_time:
                 mean_confidence = sum(evt.confidence for evt in evts) / len(evts)
                 first = evts[0]
-                event = AggregateEvent(tracking_id=id, timestamp=now, time_span=span, label=first.label, confidence=mean_confidence)
+                event = AggregateEvent(
+                    tracking_id=id,
+                    timestamp=now,
+                    time_span=last.timestamp - first.timestamp,
+                    label=first.label,
+                    confidence=mean_confidence,
+                )
 
                 logger.info(f"Aggregating event: {event}")
 
                 # TODO
                 # Send forward
-
-                with open("events.log", "a") as f:
-                    f.write(f"{event}\n")
+                if mean_confidence > self.confidence_threshold:
+                    with open("events.log", "a") as f:
+                        _ = f.write(f"{event}\n")
 
                 del self.predictions[id]
 
 
-async def inference_worker(channel_manager: DataChannelManager, aggregator: Aggregator):
+async def inference_worker(
+    channel_manager: DataChannelManager,
+    aggregator: Aggregator,
+):
     """Continuously read frames from queue and run ML inference."""
     while True:
         frame = await inference_queue.get()
         try:
-            img = frame.to_ndarray(format="bgr24")
-            img_small = cv2.resize(img, (640, 360))
-
-            start = time.process_time()
-            results = model.track(img_small, persist=True)  
-            elapsed = time.process_time() - start
-            logger.info(f"Elapsed time for inference: {elapsed * 1000:.2f} ms")
-
-            boxes = results[0].boxes
-
-            if not boxes:
-                continue
-
-            tracking_ids = boxes.id
-            if tracking_ids is None:
-                logger.warning("No tracking IDs found, skipping frame")
-                continue
-
-            tracking_ids = tracking_ids.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
-            bxs: list[list[float]] = boxes.xyxy.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
-            labels: list[float] = boxes.cls.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
-            confs: list[float] = boxes.conf.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
-
-            label_names = [model.names[int(lbl)] for lbl in labels]
-            confs = [round(float(conf), 3) for conf in confs]
-
-            logger.info(
-                f"Detected {len(bxs)} objects in frame, labels: {label_names}, confs: {confs}"
-            )
-
-            prediction = Prediction(tracking_ids=tracking_ids, boxes=bxs, labels=label_names, confs=confs)
-
-            channel_manager.send_prediction(prediction)
-
-            aggregator.add_prediction(prediction)
-
+            prediction = await asyncio.to_thread(process_frame, frame)
+            if prediction:
+                channel_manager.send_prediction(prediction)
+                aggregator.add_prediction(prediction)
         except Exception as e:
             logger.error("Inference error:", e)
         finally:
             inference_queue.task_done()
+
+
+def process_frame(frame: VideoFrame) -> Prediction | None:
+    img = frame.to_ndarray(format="bgr24")
+    img_small = cv2.resize(img, (640, 360))
+
+    start = time.process_time()
+    results = model.track(img_small, persist=True)
+    elapsed = time.process_time() - start
+    logger.info(f"Elapsed time for inference: {elapsed * 1000:.2f} ms")
+
+    boxes = results[0].boxes
+
+    if not boxes:
+        return None
+
+    tracking_ids = boxes.id  # pyright: ignore[reportUnknownMemberType]
+    if tracking_ids is None:
+        logger.warning("No tracking IDs found, skipping frame")
+        return None
+
+    tracking_ids = tracking_ids.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue, reportUnknownVariableType]
+    bxs: list[list[float]] = boxes.xyxy.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue, reportUnknownVariableType]
+    labels: list[float] = boxes.cls.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue, reportUnknownVariableType]
+    confs: list[float] = boxes.conf.cpu().numpy().tolist()  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue, reportUnknownVariableType]
+
+    label_names = [model.names[int(lbl)] for lbl in labels]
+    confs = [round(float(conf), 3) for conf in confs]
+
+    logger.info(
+        f"Detected {len(bxs)} objects in frame, labels: {label_names}, confs: {confs}"
+    )
+
+    prediction = Prediction(
+        tracking_ids=tracking_ids, boxes=bxs, labels=label_names, confs=confs
+    )
+
+    return prediction
+
+
+@app.get("/")
+async def root():
+    return {"message": "Hello World"}
 
 
 class Offer(BaseModel):
@@ -273,11 +303,9 @@ async def offer(offer: Offer, request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid SDP: {e}")
 
-
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
 
     logger.info(f"PC {pc_id} answered")
 
     return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-
