@@ -66,7 +66,7 @@ async function connect() {
     await pc.setLocalDescription(offer);
     console.log("Created offer, sending to server...");
 
-    const resp = await fetch("http://localhost:8000/offer", {
+    const resp = await fetch("http://localhost:8000/webrtc/offer", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
